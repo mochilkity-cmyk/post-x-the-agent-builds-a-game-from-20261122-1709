@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Neon Dodger — a tiny browser game</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; padding: 0; background: #05060f; height: 100%; overflow: hidden; }
+  #game { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+// Neon Dodger — a tiny browser game built from one prompt:
+// "Build a tiny browser game: Neon Dodger. Steer the ship with arrow keys,
+//  dodge falling asteroids, collect stars for points. 3 lives. Win at 300 points.
+//  Neon style, dark space, one HTML file."
+//
+// One file, no network, no dependencies. Deterministic: a fixed seed drives
+// every asteroid and star, so the same inputs always play the same game.
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Fixed-seed RNG (mulberry32) — the whole game is reproducible.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const WIN_SCORE = 300;
+const START_LIVES = 3;
+
+const game = {
+  status: 'title', // title | playing | won | lost
+  t: 0,            // internal clock (seconds), advanced only by step()
+  score: 0,
+  lives: START_LIVES,
+  stars: 0,
+  ship: { x: 0.5, y: 0.82, vx: 0, inv: 0 }, // x,y as fractions of W,H
+  asteroids: [],
+  pickups: [],
+  spawnA: 0,
+  spawnS: 0,
+  rng: mulberry32(1337),
+  keys: { left: false, right: false, up: false, down: false },
+  bgStars: [],
+  msg: '',
+  msgT: 0,
+};
+
+function initBg() {
+  const rng = mulberry32(20261122);
+  game.bgStars = [];
+  for (let i = 0; i < 140; i++) {
+    game.bgStars.push({ x: rng(), y: rng(), r: 0.5 + rng() * 1.6, p: rng() * 6.28 });
+  }
+}
+initBg();
+
+function W() { return canvas.width; }
+function H() { return canvas.height; }
+
+function startGame() {
+  game.status = 'playing';
+  game.t = 0;
+  game.score = 0;
+  game.lives = START_LIVES;
+  game.stars = 0;
+  game.ship = { x: 0.5, y: 0.82, vx: 0, inv: 0 };
+  game.asteroids = [];
+  game.pickups = [];
+  game.spawnA = 0.4;
+  game.spawnS = 0.8;
+  game.rng = mulberry32(1337);
+  game.msg = '';
+}
+
+function spawnAsteroid() {
+  const r = game.rng;
+  const lanes = 9;
+  const lane = Math.floor(r() * lanes);
+  const x = (lane + 0.5) / lanes + (r() - 0.5) * 0.05;
+  const size = 0.022 + r() * 0.028; // fraction of W
+  const speed = 0.16 + r() * 0.14;  // fraction of H per second
+  const rot = r() * 6.28;
+  const vr = (r() - 0.5) * 2.2;
+  game.asteroids.push({ x, y: -0.06, size, speed, rot, vr, verts: 7 + Math.floor(r() * 3) });
+  if (r() < 0.35) {
+    const lane2 = Math.floor(r() * lanes);
+    game.asteroids.push({
+      x: (lane2 + 0.5) / lanes + (r() - 0.5) * 0.05, y: -0.12,
+      size: 0.022 + r() * 0.024, speed: 0.16 + r() * 0.12,
+      rot: r() * 6.28, vr: (r() - 0.5) * 2.2, verts: 7 + Math.floor(r() * 3),
+    });
+  }
+}
+
+function spawnStar() {
+  const r = game.rng;
+  game.pickups.push({ x: 0.08 + r() * 0.84, y: -0.05, speed: 0.13 + r() * 0.05, rot: 0 });
+}
+
+function circleHit(ax, ay, ar, bx, by, br) {
+  const dx = (ax - bx) * W();
+  const dy = (ay - by) * H();
+  const d = Math.sqrt(dx * dx + dy * dy);
+  return d < (ar + br) * W();
+}
+
+function step(dt) {
+  game.t += dt;
+  if (game.status !== 'playing') return;
+  const ship = game.ship;
+  const accel = 2.6;
+  if (game.keys.left) ship.vx -= accel * dt;
+  if (game.keys.right) ship.vx += accel * dt;
+  ship.vx *= Math.pow(0.12, dt); // damping
+  ship.x += ship.vx * dt;
+  if (ship.x < 0.04) { ship.x = 0.04; ship.vx = 0; }
+  if (ship.x > 0.96) { ship.x = 0.96; ship.vx = 0; }
+  if (game.keys.up) ship.y -= 0.25 * dt;
+  if (game.keys.down) ship.y += 0.25 * dt;
+  if (ship.y < 0.55) ship.y = 0.55;
+  if (ship.y > 0.9) ship.y = 0.9;
+  if (ship.inv > 0) ship.inv -= dt;
+
+  game.spawnA -= dt;
+  if (game.spawnA <= 0) { spawnAsteroid(); game.spawnA = 0.55; }
+  game.spawnS -= dt;
+  if (game.spawnS <= 0) { spawnStar(); game.spawnS = 0.9; }
+
+  game.score += dt * 15; // survival points
+
+  const shipR = 0.02;
+  for (let i = game.asteroids.length - 1; i >= 0; i--) {
+    const a = game.asteroids[i];
+    a.y += a.speed * dt;
+    a.rot += a.vr * dt;
+    if (a.y > 1.1) { game.asteroids.splice(i, 1); continue; }
+    if (ship.inv <= 0 && circleHit(a.x, a.y, a.size, ship.x, ship.y, shipR)) {
+      game.asteroids.splice(i, 1);
+      game.lives -= 1;
+      ship.inv = 2.0;
+      game.msg = game.lives > 0 ? 'HIT! ' + game.lives + (game.lives === 1 ? ' LIFE LEFT' : ' LIVES LEFT') : '';
+      game.msgT = 1.6;
+      if (game.lives <= 0) { game.status = 'lost'; }
+    }
+  }
+  for (let i = game.pickups.length - 1; i >= 0; i--) {
+    const s = game.pickups[i];
+    s.y += s.speed * dt;
+    s.rot += dt * 2;
+    if (s.y > 1.1) { game.pickups.splice(i, 1); continue; }
+    if (circleHit(s.x, s.y, 0.018, ship.x, ship.y, shipR + 0.012)) {
+      game.pickups.splice(i, 1);
+      game.stars += 1;
+      game.score += 25;
+      game.msg = 'STAR +25';
+      game.msgT = 0.9;
+    }
+  }
+  if (game.msgT > 0) game.msgT -= dt;
+  if (game.score >= WIN_SCORE) {
+    game.score = WIN_SCORE;
+    game.status = 'won';
+  }
+}
+
+function drawStar4(x, y, r, color) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 14;
+  ctx.beginPath();
+  ctx.moveTo(0, -r);
+  ctx.quadraticCurveTo(0, 0, r, 0);
+  ctx.quadraticCurveTo(0, 0, 0, r);
+  ctx.quadraticCurveTo(0, 0, -r, 0);
+  ctx.quadraticCurveTo(0, 0, 0, -r);
+  ctx.fill();
+  ctx.restore();
+}
+
+function render() {
+  const w = W(), h = H();
+  ctx.fillStyle = '#05060f';
+  ctx.fillRect(0, 0, w, h);
+
+  // background stars (twinkle from the internal clock — deterministic)
+  for (const s of game.bgStars) {
+    const a = 0.25 + 0.55 * Math.abs(Math.sin(game.t * 0.9 + s.p));
+    ctx.globalAlpha = a;
+    ctx.fillStyle = '#cfe6ff';
+    ctx.beginPath();
+    ctx.arc(s.x * w, s.y * h, s.r, 0, 6.29);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // nebula blobs
+  ctx.save();
+  ctx.globalAlpha = 0.10;
+  ctx.fillStyle = '#7b2ff7';
+  ctx.beginPath(); ctx.arc(w * 0.18, h * 0.25, w * 0.16, 0, 6.29); ctx.fill();
+  ctx.fillStyle = '#00e5ff';
+  ctx.beginPath(); ctx.arc(w * 0.85, h * 0.7, w * 0.13, 0, 6.29); ctx.fill();
+  ctx.restore();
+
+  if (game.status === 'title') {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#00f0ff';
+    ctx.shadowColor = '#00f0ff'; ctx.shadowBlur = 26;
+    ctx.font = `900 ${Math.round(h * 0.11)}px 'DejaVu Sans Mono', monospace`;
+    ctx.fillText('NEON DODGER', w / 2, h * 0.36);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#ff2e88';
+    ctx.font = `700 ${Math.round(h * 0.035)}px 'DejaVu Sans Mono', monospace`;
+    ctx.fillText('STEER  •  DODGE  •  COLLECT', w / 2, h * 0.46);
+    ctx.fillStyle = '#e8f6ff';
+    ctx.font = `${Math.round(h * 0.032)}px 'DejaVu Sans Mono', monospace`;
+    ctx.fillText('Arrow keys / A D to fly — dodge the asteroids, grab the stars.', w / 2, h * 0.56);
+    ctx.fillText('3 lives. First to 300 points wins.', w / 2, h * 0.62);
+    const blink = 0.55 + 0.45 * Math.sin(game.t * 4);
+    ctx.globalAlpha = blink;
+    ctx.fillStyle = '#ffd319';
+    ctx.font = `700 ${Math.round(h * 0.04)}px 'DejaVu Sans Mono', monospace`;
+    ctx.fillText('PRESS SPACE TO START', w / 2, h * 0.74);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#8b93b8';
+    ctx.font = `${Math.round(h * 0.024)}px 'DejaVu Sans Mono', monospace`;
+    ctx.fillText('a tiny browser game — one file, no network', w / 2, h * 0.86);
+    return;
+  }
+
+  // asteroids
+  for (const a of game.asteroids) {
+    const x = a.x * w, y = a.y * h, r = a.size * w;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(a.rot);
+    ctx.fillStyle = '#1a0b26';
+    ctx.strokeStyle = '#ff2e88';
+    ctx.lineWidth = 2.5;
+    ctx.shadowColor = '#ff2e88'; ctx.shadowBlur = 16;
+    ctx.beginPath();
+    for (let i = 0; i < a.verts; i++) {
+      const ang = (i / a.verts) * 6.283;
+      const rr = r * (0.78 + 0.22 * Math.sin(i * 2.7 + a.verts));
+      if (i === 0) ctx.moveTo(Math.cos(ang) * rr, Math.sin(ang) * rr);
+      else ctx.lineTo(Math.cos(ang) * rr, Math.sin(ang) * rr);
+    }
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+
+  // stars
+  for (const s of game.pickups) {
+    drawStar4(s.x * w, s.y * h, Math.max(9, w * 0.014), '#ffd319');
+  }
+
+  // ship (blink while invulnerable)
+  const ship = game.ship;
+  if (!(ship.inv > 0 && Math.floor(game.t * 10) % 2 === 0)) {
+    const x = ship.x * w, y = ship.y * h, s = w * 0.026;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.fillStyle = '#00f0ff';
+    ctx.strokeStyle = '#e8feff';
+    ctx.lineWidth = 2;
+    ctx.shadowColor = '#00f0ff'; ctx.shadowBlur = 22;
+    ctx.beginPath();
+    ctx.moveTo(0, -s * 1.3);
+    ctx.lineTo(s * 0.95, s);
+    ctx.lineTo(0, s * 0.45);
+    ctx.lineTo(-s * 0.95, s);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    // engine flame
+    ctx.fillStyle = '#ff9f1c';
+    ctx.shadowColor = '#ff9f1c'; ctx.shadowBlur = 18;
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.4, s * 0.9);
+    ctx.lineTo(0, s * (1.7 + 0.35 * Math.sin(game.t * 22)));
+    ctx.lineTo(s * 0.4, s * 0.9);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // HUD
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#e8f6ff';
+  ctx.shadowColor = '#00f0ff'; ctx.shadowBlur = 8;
+  ctx.font = `700 ${Math.round(h * 0.038)}px 'DejaVu Sans Mono', monospace`;
+  ctx.fillText('SCORE ' + Math.floor(game.score), w * 0.03, h * 0.07);
+  ctx.fillText('STARS ' + game.stars, w * 0.03, h * 0.125);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#ff5c8a';
+  ctx.fillText('♥'.repeat(Math.max(0, game.lives)) + '♡'.repeat(Math.max(0, START_LIVES - game.lives)), w * 0.97, h * 0.07);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#8b93b8';
+  ctx.font = `${Math.round(h * 0.026)}px 'DejaVu Sans Mono', monospace`;
+  ctx.fillText('WIN AT ' + WIN_SCORE, w / 2, h * 0.07);
+  // progress bar
+  const bw = w * 0.3, bx = w / 2 - bw / 2, by = h * 0.095;
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#1b2140';
+  ctx.fillRect(bx, by, bw, 8);
+  ctx.fillStyle = '#00f0ff';
+  ctx.fillRect(bx, by, bw * Math.min(1, game.score / WIN_SCORE), 8);
+
+  if (game.msgT > 0 && game.msg) {
+    ctx.fillStyle = '#ffd319';
+    ctx.shadowColor = '#ffd319'; ctx.shadowBlur = 14;
+    ctx.font = `700 ${Math.round(h * 0.042)}px 'DejaVu Sans Mono', monospace`;
+    ctx.fillText(game.msg, w / 2, h * 0.2);
+    ctx.shadowBlur = 0;
+  }
+
+  if (game.status === 'won' || game.status === 'lost') {
+    ctx.fillStyle = 'rgba(3, 4, 12, 0.72)';
+    ctx.fillRect(0, 0, w, h);
+    ctx.textAlign = 'center';
+    if (game.status === 'won') {
+      ctx.fillStyle = '#00f0ff';
+      ctx.shadowColor = '#00f0ff'; ctx.shadowBlur = 30;
+      ctx.font = `900 ${Math.round(h * 0.12)}px 'DejaVu Sans Mono', monospace`;
+      ctx.fillText('YOU WIN!', w / 2, h * 0.42);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#e8f6ff';
+      ctx.font = `700 ${Math.round(h * 0.04)}px 'DejaVu Sans Mono', monospace`;
+      ctx.fillText('300 POINTS — THE DODGER LIVES', w / 2, h * 0.53);
+    } else {
+      ctx.fillStyle = '#ff2e63';
+      ctx.shadowColor = '#ff2e63'; ctx.shadowBlur = 30;
+      ctx.font = `900 ${Math.round(h * 0.12)}px 'DejaVu Sans Mono', monospace`;
+      ctx.fillText('GAME OVER', w / 2, h * 0.42);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#e8f6ff';
+      ctx.font = `700 ${Math.round(h * 0.04)}px 'DejaVu Sans Mono', monospace`;
+      ctx.fillText('THE ASTEROIDS GOT YOU', w / 2, h * 0.53);
+    }
+    ctx.fillStyle = '#ffd319';
+    ctx.font = `${Math.round(h * 0.036)}px 'DejaVu Sans Mono', monospace`;
+    ctx.fillText('SCORE ' + Math.floor(game.score) + '   •   STARS ' + game.stars, w / 2, h * 0.63);
+    ctx.fillStyle = '#8b93b8';
+    ctx.font = `${Math.round(h * 0.03)}px 'DejaVu Sans Mono', monospace`;
+    ctx.fillText('Press R to play again', w / 2, h * 0.72);
+  }
+}
+
+// Real-time loop (browser play). Capture tooling pauses this loop and
+// steps the game with fixed dt instead, so frames are reproducible.
+let last = 0;
+let paused = false;
+function loop(ts) {
+  if (paused) return;
+  const dt = Math.min(0.05, (ts - last) / 1000 || 0.016);
+  last = ts;
+  step(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'ArrowLeft' || e.code === 'KeyA') game.keys.left = true;
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') game.keys.right = true;
+  if (e.code === 'ArrowUp' || e.code === 'KeyW') game.keys.up = true;
+  if (e.code === 'ArrowDown' || e.code === 'KeyS') game.keys.down = true;
+  if ((e.code === 'Space' || e.code === 'Enter') && game.status !== 'playing') startGame();
+  if (e.code === 'KeyR' && (game.status === 'won' || game.status === 'lost')) startGame();
+  if (e.code === 'KeyP') paused = !paused;
+  if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', (e) => {
+  if (e.code === 'ArrowLeft' || e.code === 'KeyA') game.keys.left = false;
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') game.keys.right = false;
+  if (e.code === 'ArrowUp' || e.code === 'KeyW') game.keys.up = false;
+  if (e.code === 'ArrowDown' || e.code === 'KeyS') game.keys.down = false;
+});
+
+// Deterministic driver hook (used by the video capture; same code path).
+window.NEON = {
+  game,
+  start: startGame,
+  step,
+  render,
+  pause(v) { paused = !!v; },
+  setKeys(k) { Object.assign(game.keys, k); },
+  snapshot() {
+    return {
+      status: game.status, t: +game.t.toFixed(3), score: Math.floor(game.score),
+      lives: game.lives, stars: game.stars,
+      shipX: +game.ship.x.toFixed(4), shipY: +game.ship.y.toFixed(4),
+      asteroids: game.asteroids.length, pickups: game.pickups.length,
+    };
+  },
+};
+
+render();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
